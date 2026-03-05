@@ -2,9 +2,11 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
+import { createServer as createHttpServer, IncomingMessage, ServerResponse } from "node:http";
 
 dotenv.config();
 
@@ -20,6 +22,10 @@ const DEFAULT_SEEDREAM_MODEL_NAME: SeedreamModelId = "doubao-seedream-5-0-lite-2
 const SEEDREAM_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/images/generations";
 const CONTENT_GENERATION_TASKS_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks";
 const ARK_API_KEY = process.env.ARK_API_KEY;
+const MCP_TRANSPORT = (process.env.MCP_TRANSPORT || "stdio").toLowerCase();
+const MCP_HTTP_HOST = process.env.MCP_HTTP_HOST || "0.0.0.0";
+const MCP_HTTP_PORT = Number.parseInt(process.env.MCP_HTTP_PORT || "3000", 10);
+const MCP_HTTP_PATH = process.env.MCP_HTTP_PATH || "/mcp";
 
 const SUPPORTED_SEEDANCE_VIDEO_MODELS = [
   "doubao-seedance-1-5-pro-251215",
@@ -287,10 +293,16 @@ function arkOnlyUnsupported(toolName: string) {
   return textResult(`工具 ${toolName} 已停用：当前服务已切换为“火山方舟 Ark-only”模式，仅支持 Seedream 图片与 Seedance 视频能力。`);
 }
 
-const server = new McpServer({
-  name: "jimenggen",
-  version: "1.1.2"
-});
+function createMcpServer() {
+  const server = new McpServer({
+    name: "jimenggen",
+    version: "1.1.2"
+  });
+  registerTools(server);
+  return server;
+}
+
+function registerTools(server: McpServer) {
 
 server.tool(
   "text-to-image",
@@ -630,11 +642,160 @@ server.tool(
     );
   }
 );
+}
+
+function normalizeHttpPath(pathValue: string): string {
+  const trimmed = (pathValue || "/mcp").trim();
+  if (!trimmed) return "/mcp";
+  return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+}
+
+function writeJson(res: ServerResponse, statusCode: number, payload: unknown) {
+  if (res.writableEnded) return;
+  res.statusCode = statusCode;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(payload));
+}
+
+async function parseJsonBody(req: IncomingMessage): Promise<unknown | undefined> {
+  return await new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    req.on("end", () => {
+      if (chunks.length === 0) {
+        resolve(undefined);
+        return;
+      }
+      const raw = Buffer.concat(chunks).toString("utf8").trim();
+      if (!raw) {
+        resolve(undefined);
+        return;
+      }
+      try {
+        resolve(JSON.parse(raw));
+      } catch {
+        reject(new Error("请求体不是合法JSON"));
+      }
+    });
+    req.on("error", (error) => reject(error));
+  });
+}
+
+async function startHttpMcpServer() {
+  if (!Number.isInteger(MCP_HTTP_PORT) || MCP_HTTP_PORT < 1 || MCP_HTTP_PORT > 65535) {
+    throw new Error(`MCP_HTTP_PORT 配置非法: ${process.env.MCP_HTTP_PORT}`);
+  }
+
+  const path = normalizeHttpPath(MCP_HTTP_PATH);
+  const server = createMcpServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined
+  });
+  await server.connect(transport);
+
+  const httpServer = createHttpServer(async (req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, mcp-session-id, mcp-protocol-version");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+
+    if (req.method === "OPTIONS") {
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+
+    const currentUrl = new URL(req.url || "/", "http://localhost");
+    if (currentUrl.pathname !== path) {
+      writeJson(res, 404, {
+        error: "not_found",
+        message: `仅支持 ${path} 路径`
+      });
+      return;
+    }
+
+    const method = req.method || "GET";
+    if (!["GET", "POST", "DELETE"].includes(method)) {
+      res.setHeader("Allow", "GET, POST, DELETE, OPTIONS");
+      writeJson(res, 405, {
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: "Method not allowed"
+        },
+        id: null
+      });
+      return;
+    }
+
+    try {
+      let parsedBody: unknown = undefined;
+      if (method === "POST") {
+        parsedBody = await parseJsonBody(req);
+      }
+      await transport.handleRequest(req, res, parsedBody);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!res.headersSent) {
+        if (message === "请求体不是合法JSON") {
+          writeJson(res, 400, {
+            jsonrpc: "2.0",
+            error: {
+              code: -32700,
+              message
+            },
+            id: null
+          });
+          return;
+        }
+        writeJson(res, 500, {
+          jsonrpc: "2.0",
+          error: {
+            code: -32603,
+            message
+          },
+          id: null
+        });
+      }
+    }
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(MCP_HTTP_PORT, MCP_HTTP_HOST, () => resolve());
+  });
+
+  let isShuttingDown = false;
+  const shutdown = async () => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    httpServer.close();
+    await transport.close().catch(() => undefined);
+    await server.close().catch(() => undefined);
+    process.exit(0);
+  };
+  process.on("SIGINT", () => { void shutdown(); });
+  process.on("SIGTERM", () => { void shutdown(); });
+
+  console.error(`火山方舟 Seedream/Seedance MCP服务已启动（Ark-only, http）`);
+  console.error(`监听地址: http://${MCP_HTTP_HOST}:${MCP_HTTP_PORT}${path}`);
+}
 
 async function main() {
+  const mode = MCP_TRANSPORT;
+  if (mode === "http") {
+    await startHttpMcpServer();
+    return;
+  }
+  if (mode !== "stdio") {
+    throw new Error(`不支持的 MCP_TRANSPORT=${mode}，仅支持 stdio 或 http`);
+  }
+
+  const server = createMcpServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("火山方舟 Seedream MCP服务已启动（Ark-only）");
+  console.error("火山方舟 Seedream/Seedance MCP服务已启动（Ark-only, stdio）");
 }
 
 main().catch((error) => {
